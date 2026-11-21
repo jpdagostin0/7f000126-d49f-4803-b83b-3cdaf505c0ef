@@ -91,6 +91,9 @@ TIGHT = os.environ.get("BR_NO_TIGHT") != "1"  # exact line sets of the long test
 TOKCHECK = os.environ.get("BR_NO_TOKCHECK") != "1"  # token streams of the long tests' inputs (tokcheck.py)
 TOKCHECK_SECONDS = 2.0  # CPU limit of that check; inputs left unchecked count as changed
 # files whose code runs inside Tokenizer.tokenize (with the trie of the keywords)
+PLANCHECK = os.environ.get("BR_NO_PLANCHECK") != "1"  # what the TPC-DS executor test gets from the patched code (plancheck.py)
+PLANCHECK_SECONDS = 10.0  # CPU limit of that check and of the reduced run after it
+PLANCHECK_TASKS = 4  # with more changed queries than this, the test is selected as before
 TOKENIZER_FILES = frozenset(("sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/trie.py", "sqlglot/jsonpath.py"))
 NO_CONE = os.environ.get("BR_NO_CONE") == "1" or cone is None  # validation: every import-time commit imports the whole tree
 
@@ -293,7 +296,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "plancheck")
 
     def __init__(self, commit):
         self.commit = commit
@@ -328,6 +331,7 @@ class Plan:
         self.gone = set()  # module or class names that the patch removes (no reduced runs then)
         self.must = set()  # tests that read changed test data directly: selected when held
         self.tokcheck = []  # held long tests whose tokenize inputs the child tokenizes again (tokcheck.py)
+        self.plancheck = None  # (the held TPC-DS executor test, the tests whose failure selects it): see plancheck_tasks
         self.sure_infected = set()  # tests whose own evaluations of an edited comparison change (infect.py)
         self.added = []  # (test id, first later test) of test methods that the patch adds
         self.watch = []  # (module, descriptor) of shared containers to watch (shared_write_watch)
@@ -1798,6 +1802,44 @@ def run_tokcheck(numbers, wfd):
         os.write(wfd, b"M %d\n" % n)
 
 
+def plancheck_tasks(wfd):
+    """Child side, when a failure would select the held TPC-DS executor test (see finish): the
+    queries of the test go through the patched code up to the executor (plancheck.py).
+    Returns (the pool tasks of the changed queries, CPU seconds left), or None when they are
+    many or unknown: the parent then selects the test as before."""
+    os.write(wfd, b"K\n")  # no time cap from here
+    import plancheck
+    import preload
+
+    budget = PLANCHECK_SECONDS * SLOWDOWN
+    t0 = time.process_time()
+    tasks = plancheck.changed_tasks(preload.EXEC_CACHE, budget, PLANCHECK_TASKS)
+    return None if tasks is None else (tasks, budget - (time.process_time() - t0))
+
+
+def run_plancheck(n, tasks, left, tests, emit, started, wfd):
+    """Child side, after the tests of the commit: the verdict of the held TPC-DS executor test
+    n. It passes when no query changed, and else runs with the changed ones alone."""
+    if not tasks:
+        os.write(wfd, b"%d 0 0\n" % n)
+        return
+    import plancheck
+    import runner
+
+    if PANDAS_USERS and n in PANDAS_USERS:
+        import lazymods
+
+        lazymods.load()
+    # past the CPU limit the alarm ends the test with an error: a failure for the parent
+    old = signal.signal(signal.SIGVTALRM, plancheck._alarm)
+    signal.setitimer(signal.ITIMER_VIRTUAL, max(0.05, left))
+    try:
+        runner.run_tests([(n, tests[n]["id"])], emit, False, {n: (None, set(tasks))}, started)
+    finally:
+        signal.setitimer(signal.ITIMER_VIRTUAL, 0)
+        signal.signal(signal.SIGVTALRM, old)
+
+
 def child_reporters(wfd):
     """The two functions through which a child reports its test runs to the parent, and the
     state that they keep. Returns (emit, started, settings, watches, begin):
@@ -2090,7 +2132,22 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             gc.freeze()
         t_setup = time.process_time()
         settings[0] = _interpreter_settings()
-        runner.run_tests([(n, tests[n]["id"]) for n in order], emit, False, keeps, started, skip_after_fail, plan.enders)
+        failed = []
+        checked = []
+
+        def emit_noting(number, bad):
+            emit(number, bad)
+            if bad and plan.plancheck and not checked:
+                failed.append(number)
+                if number in plan.plancheck[1] or len(failed) >= MANY_FAILURES:
+                    checked.append(plancheck_tasks(wfd))
+                    if checked[0] is not None:
+                        # the held test gets its own verdict: no run ends early on its account
+                        plan.enders.clear()
+
+        runner.run_tests([(n, tests[n]["id"]) for n in order], emit_noting, False, keeps, started, skip_after_fail, plan.enders)
+        if checked and checked[0] is not None:
+            run_plancheck(plan.plancheck[0], checked[0][0], checked[0][1], tests, emit, started, wfd)
         if plan.added and plan.mode in ("fresh", "fresh_purge"):
             run_added_tests(plan.added, wfd)
         if DEBUG:
@@ -2567,6 +2624,11 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
                     t_cap = None
                     cap = None
                     t_test = time.monotonic() + 2 * TEST_TIMEOUT * SLOWDOWN
+                elif line == b"K":
+                    # the plan check runs (see plancheck_tasks): its CPU limit is its own
+                    t_cap = None
+                    cap = None
+                    t_test = time.monotonic() + 6 * PLANCHECK_SECONDS * SLOWDOWN
                 elif line.startswith(b"D "):
                     keys = None if line == b"D many" else json.loads(line[2:])
                     if DEBUG:
@@ -3131,6 +3193,7 @@ def run(t_start, deadline, state):
         return fixture_readers.get(n) or frozenset()
 
     def finish(c, plan, verdicts, status, ran, held, blind=()):
+        held = [n for n in held if n not in verdicts]  # a held test with a verdict: see run_plancheck
         failing = {n for n, bad in verdicts.items() if bad}
         selected = set(failing)
         selected.update(blind)
@@ -3336,6 +3399,22 @@ def run(t_start, deadline, state):
         # are selected as they are. The answer then holds every candidate without a pass.
         plan.enders = {}
         long_held = [t for t in held if seconds[t] > QUIET_HOLD_SECONDS]
+        plan.plancheck = None
+        if PLANCHECK and plan.mode == "hot" and not RUN_ALL and not plan.watch and ran:
+            import plancheck
+
+            t = next((n for n in long_held if tests[n]["id"] == plancheck.TEST_ID), None)
+            saved = plancheck.load(preload.EXEC_CACHE) if t is not None and t not in plan.must and t not in plan.sure_infected else None
+            pinned = {}
+            for rel in plan.files if saved else ():
+                try:
+                    with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+                        pinned[rel] = f.read()
+                except (OSError, ValueError):
+                    pinned[rel] = None  # a new file, or not text
+            if saved and plancheck.eligible(saved, {rel: (pinned[rel], text) for rel, text in plan.files.items()}):
+                t_class, t_fixtures = tests[t]["id"].rsplit("::", 1)[0], fixtures_of(t)
+                plan.plancheck = (t, {n for n in ran if tests[n]["id"].rsplit("::", 1)[0] == t_class or t_fixtures & fixtures_of(n)})
         if long_held and not RUN_ALL and not plan.watch and max(seconds[t] for t in long_held) >= sum(seconds[n] for n in ran):
             plan.enders["held"] = set(long_held)
             left_cost = sum(cost[n] for n in ran)
@@ -3354,6 +3433,8 @@ def run(t_start, deadline, state):
         cap = None
         if ran and not RUN_ALL:
             cap = SLOWDOWN * (2.0 + 3.0 * sum(cost[n] for n in ran)) + max(allowed.values())
+        if plan.plancheck:
+            allowed[plan.plancheck[0]] = 6 * PLANCHECK_SECONDS * SLOWDOWN
         return ran, held, allowed, skip, cap
 
     def execute(c, plan, index):
