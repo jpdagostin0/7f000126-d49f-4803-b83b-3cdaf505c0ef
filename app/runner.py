@@ -160,7 +160,7 @@ def run_tests(items, emit, stop_after_fail=False, keeps=None, started=None, skip
     suite.run(result)
     if result.class_errors and not result.shouldStop:
         # a class whose setUpClass failed never starts its tests: all of them fail
-        for cls, numbers in by_class.items():
+        for numbers in by_class.values():
             for number in numbers:
                 if number not in seen:
                     emit(number, True)

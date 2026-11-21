@@ -644,9 +644,13 @@ def install_open_overlay(root: str, files: dict):
                 return real_open(file, mode, *args, **kwargs)
             if "b" in mode:
                 return io.BytesIO(text.encode("utf-8", "surrogateescape"))
-            newline = kwargs.get("newline")
+            newline = kwargs.get("newline", args[3] if len(args) > 3 else None)
             encoding = kwargs.get("encoding", args[1] if len(args) > 1 else None)
-            if (encoding or "utf-8").lower().replace("_", "-") in ("utf-8", "utf8") and text.isascii():
+            if (
+                (encoding or "utf-8").lower().replace("_", "-") in ("utf-8", "utf8")
+                and text.isascii()
+                and newline in (None, "", "\n")
+            ):
                 return io.StringIO(text, newline=newline)
             # other encodings, or bytes that are not plain ASCII: decode the file's bytes the
             # way open() does (a byte that is not valid UTF-8 raises there too)

@@ -29,7 +29,7 @@ def main(repo, out):
         "okeys": sorted(f.objects),
     }
     objects = selector.resolve_base_objects(data["okeys"])
-    if objects is None or any(objects[k] is not f.objects[k] for k in f.objects):
+    if objects is None or any(objects[k] is not value for k, value in f.objects.items()):
         raise SystemExit("base state: the table keys do not resolve to the snapshot's objects")
     with open(out, "wb") as fh:
         marshal.dump(data, fh)

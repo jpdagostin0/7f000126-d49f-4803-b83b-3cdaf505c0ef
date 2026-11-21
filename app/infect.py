@@ -116,10 +116,7 @@ def _same(a, b, out):
     if isinstance(a, list):
         if len(a) != len(b):
             return False
-        for x, y in zip(a, b):
-            if not _same(x, y, out):
-                return False
-        return True
+        return all(_same(x, y, out) for x, y in zip(a, b))
     if isinstance(a, (float, complex)):
         return repr(a) == repr(b)
     return a == b

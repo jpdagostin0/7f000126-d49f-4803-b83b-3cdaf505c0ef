@@ -98,7 +98,8 @@ class Heap:
         # with the imported modules before their importers (walk_order, from build_cone.py), so
         # that a table which an importer only refers to belongs to the module that made it.
         first = [m for m in walk_order if m in self.modules]
-        rest = [m for m in self.order if m not in set(first)]
+        first_set = set(first)
+        rest = [m for m in self.order if m not in first_set]
         for m in first + rest:
             self._walk(self.modules[m], seen)
         self.by_owner = {}

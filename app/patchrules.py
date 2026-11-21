@@ -30,7 +30,7 @@ def test_files(maps):
     if out is None:
         out = _SRC["test_files"] = {}
         for n, tid in enumerate(maps.meta["test_ids"]):
-            out.setdefault(tid.split("::")[0], []).append(n)
+            out.setdefault(tid.split("::", 1)[0], []).append(n)
     return out
 
 

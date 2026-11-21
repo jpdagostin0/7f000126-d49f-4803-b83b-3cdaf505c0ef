@@ -3,6 +3,7 @@ its content against a hash taken from a git checkout of that commit, and unpacks
 import hashlib
 import io
 import os
+import stat
 import sys
 import tarfile
 import time
@@ -24,7 +25,7 @@ def tree_digest(root):
         for f in sorted(files):
             p = os.path.join(d, f)
             rel = os.path.relpath(p, root)
-            mode = "755" if os.stat(p).st_mode & 0o100 else "644"
+            mode = "755" if os.stat(p).st_mode & stat.S_IXUSR else "644"
             with open(p, "rb") as fh:
                 h = hashlib.sha256(fh.read()).hexdigest()
             lines.append(f"{rel}\0{mode}\0{h}\n")

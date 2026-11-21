@@ -18,9 +18,9 @@ def build_units(src: str):
     units = []
     flags = 0
     for node in tree.body:
-        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
-            if any(a.name == "annotations" for a in node.names):
-                flags = 0x1000000
+        if (isinstance(node, ast.ImportFrom) and node.module == "__future__"
+                and any(a.name == "annotations" for a in node.names)):
+            flags = 0x1000000
 
     def first_line(node):
         decos = getattr(node, "decorator_list", None)

@@ -2824,7 +2824,7 @@ def pack(numbers, seconds):
     """Splits tests over 1..8 workers to minimise (largest load + 2 s per worker)."""
     if not numbers:
         return []
-    items = sorted(numbers, key=lambda n: -seconds[n])
+    items = sorted(numbers, key=seconds.__getitem__, reverse=True)
     best = None
     for k in range(1, min(8, len(items)) + 1):
         loads = [0.0] * k

@@ -100,7 +100,7 @@ def _read_workers(line_value: Any) -> list[list[int]] | None:
 def _has_line_shape(line_value: Any) -> bool:
     return (
         isinstance(line_value, dict)
-        and set(line_value.keys()) == {"commit", "workers"}
+        and set(line_value) == {"commit", "workers"}
         and isinstance(line_value["commit"], str)
         and isinstance(line_value["workers"], list)
     )

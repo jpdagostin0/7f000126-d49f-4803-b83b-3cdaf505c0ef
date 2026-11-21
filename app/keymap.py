@@ -64,7 +64,7 @@ def stable_key(k):
 
 def holder_name(key):
     """The name of a statefp key ("A", module, class path, attribute) or ("G", module, name)."""
-    return "|".join(str(x) for x in key)
+    return "|".join(map(str, key))
 
 
 def changed_entries(old, new, fp_old, fp_new):

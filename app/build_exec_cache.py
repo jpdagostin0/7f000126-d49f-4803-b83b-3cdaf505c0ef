@@ -36,7 +36,7 @@ def main():
         assert list(tables) == list(schema)
         sizes = {t: os.path.getsize(f"{directory}{t}.csv.gz") for t in schema}
         rows = {t: marshal.dumps(tables[t].rows) for t in schema}
-        path = os.path.join(out, "exec_%s.marshal" % which)
+        path = os.path.join(out, f"exec_{which}.marshal")
         with open(path + ".tmp", "wb") as f:
             marshal.dump((sizes, rows), f)
         os.replace(path + ".tmp", path)

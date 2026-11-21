@@ -153,11 +153,7 @@ class InlinePool:
     def map(self, fn, *iterables, timeout=None, chunksize=1):
         futures = [self.submit(fn, *args) for args in zip(*iterables)]
 
-        def results():
-            for f in futures:
-                yield f.result()
-
-        return results()
+        return (future.result() for future in futures)
 
     def shutdown(self, wait=True, *, cancel_futures=False):
         self._shutdown = True

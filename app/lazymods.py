@@ -96,10 +96,10 @@ def install() -> bool:
     return True
 
 
-def loaded(name) -> bool:
+def loaded(name: str) -> bool:
     """True when the real module has run (or no stand-in was installed)."""
-    m = sys.modules.get(name)
-    return m is not None and type(m) is not _LazyModule
+    module = sys.modules.get(name)
+    return module is not None and type(module) is not _LazyModule
 
 
 def load() -> None:

@@ -48,7 +48,8 @@ class Fingerprinter:
                 return h
         if h is None:
             self.code_objects.append(c)
-            parts = [c.co_code, c.co_names, c.co_varnames, c.co_freevars, c.co_argcount, c.co_flags]
+            parts = [c.co_code, c.co_names, c.co_varnames, c.co_freevars, c.co_argcount,
+                     c.co_posonlyargcount, c.co_kwonlyargcount, c.co_flags]
             for k in c.co_consts:
                 parts.append(self.code(k) if isinstance(k, types.CodeType) else (type(k).__name__, repr(k)))
             h = hash(tuple(parts))

@@ -152,10 +152,8 @@ def _binds(node):
 
 def _escapes(node):
     """True when the statement can leave the function or changes scope rules."""
-    for x in ast.walk(node):
-        if isinstance(x, (ast.Return, ast.Yield, ast.YieldFrom, ast.Await, ast.Global, ast.Nonlocal)):
-            return True
-    return False
+    return any(isinstance(x, (ast.Return, ast.Yield, ast.YieldFrom, ast.Await, ast.Global, ast.Nonlocal))
+               for x in ast.walk(node))
 
 
 def _stores_state(node):

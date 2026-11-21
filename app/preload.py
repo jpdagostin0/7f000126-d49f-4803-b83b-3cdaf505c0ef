@@ -147,7 +147,7 @@ def exec_rows_from_csv(mod, file_name):
     next(reader)
     for row in reader:
         if not ctypes:
-            for i, v in enumerate(row):
+            for v in row:
                 try:
                     ctypes.append(type(ast.literal_eval(v)))
                 except (ValueError, SyntaxError):

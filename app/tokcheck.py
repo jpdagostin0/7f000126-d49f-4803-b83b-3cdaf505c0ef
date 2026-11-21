@@ -34,7 +34,7 @@ def load(maps_dir):
 
 def tests_of(maps_dir):
     m = load(maps_dir)
-    return frozenset(m["tests"]) if m else frozenset()
+    return frozenset(m["tests"] if m else ())
 
 
 def build_tokenizer(key):
