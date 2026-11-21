@@ -3220,7 +3220,7 @@ def run(t_start, deadline, state):
             for n in held:
                 if seconds[n] <= QUIET_HOLD_SECONDS:
                     selected.add(n)
-                elif class_of(n) in fail_classes or fail_fixtures & fixtures_of(n):
+                elif class_of(n) in fail_classes or fail_fixtures & own_fixtures(n):
                     selected.add(n)
                 elif len(failing) >= MANY_FAILURES:
                     selected.add(n)  # a commit that breaks this much can break any test
@@ -3303,7 +3303,7 @@ def run(t_start, deadline, state):
         protect_classes = {tests[n]["id"].rsplit("::", 1)[0] for n in long_held}
         protect_fixtures = set()
         for n in long_held:
-            protect_fixtures.update(fixtures_of(n))
+            protect_fixtures.update(own_fixtures(n))
         plan.protect = {
             n for n in ran
             if tests[n]["id"].rsplit("::", 1)[0] in protect_classes
@@ -3328,6 +3328,29 @@ def run(t_start, deadline, state):
     shared_info = []
     attr_reads = {}
 
+    def load_attr_reads():
+        if not attr_reads:
+            attr_reads[""] = ()
+            try:
+                # which lists of its class fixture each test reads (build_attr_reads.py)
+                with open(os.path.join(MAPS, "class_attr_reads.json")) as f:
+                    attr_reads.update(json.load(f))
+            except (OSError, ValueError):
+                pass
+
+    def own_fixtures(n):
+        """fixtures_of(n) without the query files that reach a TestExecutor test through its
+        class fixture alone: setUpClass loads both for every test of the class, and the map
+        of the class attributes says which of the two lists the test reads (the TPC-DS run
+        reads no TPC-H query)."""
+        load_attr_reads()
+        out = fixtures_of(n)
+        path, cls_name = tests[n]["id"].split("::")[:2]
+        read = attr_reads.get(tests[n]["id"])
+        if read is not None and (path[:-3].replace("/", "."), cls_name) == preload.EXEC_KEY:
+            out = out - {"tests/fixtures/" + fixture for which, fixture in preload.EXEC_SQL_FIXTURES.items() if which + "_sqls" not in read}
+        return out
+
     def class_fixture_rule(plan):
         """A commit that changes only data files, one of them a .sql fixture whose entries a
         shared class fixture holds in a list (TestExecutor: the TPC-H and TPC-DS queries).
@@ -3337,14 +3360,9 @@ def run(t_start, deadline, state):
         changed = {rel for rel, text in plan.files.items() if rel.startswith("tests/fixtures/") and text is not None}
         if not changed or len(changed) != sum(1 for rel in plan.files if rel.startswith("tests/fixtures/")):
             return
+        load_attr_reads()
         if not shared_info:
             shared_info.extend(preload.shared_class_info(ROOT) or [None])
-            try:
-                # which of those lists each test of the class reads (build_attr_reads.py)
-                with open(os.path.join(MAPS, "class_attr_reads.json")) as f:
-                    attr_reads.update(json.load(f))
-            except (OSError, ValueError):
-                pass
         for info in shared_info:
             if info is None:
                 continue
@@ -3411,7 +3429,7 @@ def run(t_start, deadline, state):
                 except (OSError, ValueError):
                     pinned[rel] = None  # a new file, or not text
             if saved and plancheck.eligible(saved, {rel: (pinned[rel], text) for rel, text in plan.files.items()}):
-                t_class, t_fixtures = tests[t]["id"].rsplit("::", 1)[0], fixtures_of(t)
+                t_class, t_fixtures = tests[t]["id"].rsplit("::", 1)[0], own_fixtures(t)
                 plan.plancheck = (t, {n for n in ran if tests[n]["id"].rsplit("::", 1)[0] == t_class or t_fixtures & fixtures_of(n)})
         if long_held and not RUN_ALL and not plan.watch and max(seconds[t] for t in long_held) >= sum(seconds[n] for n in ran):
             plan.enders["held"] = set(long_held)
@@ -3421,7 +3439,7 @@ def run(t_start, deadline, state):
                 n_class, n_fixtures = tests[n]["id"].rsplit("::", 1)[0], fixtures_of(n)
                 decides = {
                     t for t in long_held
-                    if tests[t]["id"].rsplit("::", 1)[0] == n_class or n_fixtures & fixtures_of(t)
+                    if tests[t]["id"].rsplit("::", 1)[0] == n_class or n_fixtures & own_fixtures(t)
                 }
                 if decides:
                     plan.enders[n] = (decides, left_cost > WORKER_COST)
