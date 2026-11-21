@@ -2074,8 +2074,10 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                     preload.reduce_class_fixtures(changed)
             if plan.keeps and not NO_REDUCE:
                 keeps = apply_keeps(plan, MAPS_OBJ, tests)
-        # numpy and pandas stay lazy (lazymods.py): a test that uses them loads them. Their
-        # import changes none of the interpreter settings that emit() compares.
+        if PANDAS_USERS and any(n in PANDAS_USERS for n in order):
+            import lazymods
+
+            lazymods.load()  # before the settings snapshot below: as in the parent
         if plan.watch:
             watches.extend(resolve_watch(plan.watch))
             os.write(wfd, b"H %s\n" % json.dumps([w[0] for w in watches]).encode())
@@ -3507,9 +3509,8 @@ def run(t_start, deadline, state):
 
             lazy_pandas = lazymods.install()
         if lazy_pandas:
-            # numpy and pandas never load in this process: a child loads them at the first
-            # real use by a test (most candidates that may use them never do, as their reduced
-            # runs skip the fixture entries that execute), or never
+            # numpy and pandas load when a commit that runs one of their users comes (see
+            # pandas_turn below), or never
             PANDAS_USERS = users
         else:
             import pandas  # noqa: F401
@@ -3518,6 +3519,14 @@ def run(t_start, deadline, state):
     def needs_pandas(c):
         p = plans[c]
         return any(n in PANDAS_USERS for n in p.cands - p.blind)
+
+    pandas_turn = None  # the first commit before which the parent loads numpy and pandas
+    if lazy_pandas:
+        # the commits that need them run last, so that the forks before them are cheaper
+        hot = [c for c in hot if not needs_pandas(c)] + [c for c in hot if needs_pandas(c)]
+        needers = [c for c in hot + fresh if needs_pandas(c)]
+        if len(needers) >= 2:
+            pandas_turn = needers[0]  # with one, its child loads them (same cost, smaller forks)
 
     def exec_prebuild(hot_commits):
         """TestExecutor attributes that more than one child may read are built once here
@@ -3582,6 +3591,15 @@ def run(t_start, deadline, state):
                 safe = all_tests
             answers[c] = pack(sorted(safe), seconds)
 
+    pandas_here = []
+
+    def load_pandas_here():
+        if not pandas_here:
+            pandas_here.append(True)
+            import lazymods
+
+            lazymods.load()
+
     preimported = []
 
     def preimport_once():
@@ -3604,8 +3622,17 @@ def run(t_start, deadline, state):
         if hot:
             preload._single_thread_duckdb()  # as import_tests() does before the other children
         preimport_once()
+        if lazy_pandas:
+            # the order of the commits is now: cone commits, function-body commits, the other
+            # import-time commits. The same rule as above for that order.
+            cone_first = [c for c in cone_first if not needs_pandas(c)] + [c for c in cone_first if needs_pandas(c)]
+            later = [c for c in fresh if c not in set(cone_first)]
+            needers = [c for c in cone_first + hot + later if needs_pandas(c)]
+            pandas_turn = needers[0] if len(needers) >= 2 else None
     cone_done = set()
     for c in cone_first:
+        if c == pandas_turn:
+            load_pandas_here()
         plan = plans[c]
         plan.mode = "fresh_cone"
         if execute_safe(c, plan, None) == "REDO":
@@ -3641,7 +3668,7 @@ def run(t_start, deadline, state):
     #     their tests run on the pinned code of this process, with the patched file text. One
     #     child serves all of them, one after the other (fixture_batch_child), instead of one
     #     fork each. The commits whose tests load numpy or pandas form a group of their own:
-    #     their child loads those libraries once, before the tests.
+    #     as today, their child runs after this process has loaded those libraries.
     prepared = {}  # commit -> what prepare_plan gave
 
     def fixture_only(c):
@@ -3721,6 +3748,8 @@ def run(t_start, deadline, state):
     for c in hot:
         if c in answered:
             continue
+        if c == pandas_turn:
+            load_pandas_here()
         if c in groups:
             members = [m for m in hot if groups.get(m) == groups[c]]
             for m in members:
@@ -3744,6 +3773,8 @@ def run(t_start, deadline, state):
             plan.keeps = {n: k for n, k in plan.keeps.items() if k[4] is None}
     preimport_once()
     for c in fresh:
+        if c == pandas_turn:
+            load_pandas_here()
         plan = plans[c]
         plan.mode = "fresh_purge" if purge else "fresh"
         execute_safe(c, plan, None)
