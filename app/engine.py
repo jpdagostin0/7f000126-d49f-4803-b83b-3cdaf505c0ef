@@ -467,11 +467,10 @@ class FunctionIndex:
     def __init__(self, root):
         idx: dict = {}
         ft = types.FunctionType
-        for o in gc.get_objects():
-            if type(o) is ft:
-                c = o.__code__
-                if c.co_filename.startswith(root):
-                    idx.setdefault((c.co_filename, c.co_firstlineno, c.co_name), []).append(o)
+        for o in [o for o in gc.get_objects() if type(o) is ft]:
+            c = o.__code__
+            if c.co_filename.startswith(root):
+                idx.setdefault((c.co_filename, c.co_firstlineno, c.co_name), []).append(o)
         self.idx = idx
 
     def live(self, code):

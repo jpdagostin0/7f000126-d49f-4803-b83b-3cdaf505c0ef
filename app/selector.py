@@ -563,10 +563,8 @@ def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
             return True
         pairs = []
         if not engine.deftime_equal(a, b, pairs):
-            pairs = []
-            if patchrules.tests_read_docs(maps) or not patchrules.equal_but_doc(a, b, pairs):
-                return True
-            plan.note.append("docstring only")
+            # (a docstring counts too: tests/test_docs.py runs the doctests)
+            return True
         if all(engine.func_code_equal(x, y) for x, y in pairs):
             continue  # comments or layout only
         if not class_path and any(line.startswith("def __getattr__(") for line in old_lines[s - 1:e]):

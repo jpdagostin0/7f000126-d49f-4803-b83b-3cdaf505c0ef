@@ -10,9 +10,6 @@ import ast
 import os
 import re
 import sys
-import types
-
-import engine
 
 ROOT = os.environ.get("BR_ROOT", "/repo")
 
@@ -240,51 +237,6 @@ def _name_importers(maps, module, names):
     return out
 
 
-def _doc_consts(code):
-    """Indexes of the constants that the code only stores into __doc__ (a class or module docstring)."""
-    import dis
-
-    doc, other = set(), set()
-    ins = list(dis.get_instructions(code))
-    for i, x in enumerate(ins):
-        if x.opcode in dis.hasconst:
-            nxt = ins[i + 1] if i + 1 < len(ins) else None
-            if x.opname == "LOAD_CONST" and nxt is not None and nxt.opname == "STORE_NAME" and nxt.argval == "__doc__":
-                doc.add(x.arg)
-            else:
-                other.add(x.arg)
-    return doc - other
-
-
-def equal_but_doc(a, b, pairs):
-    """Like engine.deftime_equal, but a class or module docstring may differ. Nothing in the
-    test files reads docstrings (checked by the caller), so such a change cannot change a result."""
-    if (a.co_code != b.co_code or a.co_names != b.co_names or a.co_exceptiontable != b.co_exceptiontable
-            or len(a.co_consts) != len(b.co_consts) or a.co_flags != b.co_flags):
-        return False
-    docs = None
-    for i, (x, y) in enumerate(zip(a.co_consts, b.co_consts)):
-        ix = isinstance(x, types.CodeType)
-        if ix != isinstance(y, types.CodeType):
-            return False
-        if ix:
-            fx = x.co_flags & engine.CO_OPTIMIZED
-            if fx != (y.co_flags & engine.CO_OPTIMIZED):
-                return False
-            if fx:
-                if x.co_name != y.co_name or x.co_qualname != y.co_qualname or len(x.co_freevars) != len(y.co_freevars):
-                    return False
-                pairs.append((x, y))
-            elif not equal_but_doc(x, y, pairs):
-                return False
-        elif not engine._const_equal(x, y):
-            if docs is None:
-                docs = _doc_consts(a) & _doc_consts(b)
-            if i not in docs or not (isinstance(x, str) and isinstance(y, str)):
-                return False
-    return True
-
-
 def _name_reader_tests(maps, names, only=None, prefix=r"\b"):
     """Tests that run a line that mentions one of 'names' (coverage of the pinned commit):
     when a module or class attribute is renamed or removed, only such a line can fail.
@@ -386,15 +338,6 @@ def gone_name_tests(maps, fp, old_text):
     if attrs:
         out |= _name_reader_tests(maps, attrs)
     return top | attrs, out
-
-
-DOC_READ_RE = re.compile(r"__doc__|getdoc|doctest")
-
-
-def tests_read_docs(maps):
-    if "docs" not in _SRC:
-        _SRC["docs"] = any(DOC_READ_RE.search(source(rel)) for rel in test_files(maps))
-    return _SRC["docs"]
 
 
 def importer_tests(maps, names):
