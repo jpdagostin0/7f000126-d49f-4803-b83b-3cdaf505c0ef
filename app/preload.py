@@ -185,21 +185,32 @@ def _exec_cached_rows(mod, which):
     return data
 
 
+def _exec_views(conn, schema, directory):
+    """The views of TestExecutor.setUpClass (same statements)."""
+    for table, columns in schema.items():
+        file_name = f"{directory}{table}.csv.gz"
+        conn.execute(
+            f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                """
+        )
+
+
 def _exec_build(cls, name):
     mod = sys.modules[cls.__module__]
     which = name.split("_", 1)[0]
     schema, directory = _exec_schema(mod, which)
     if name.endswith("_conn"):
+        # Creating the views binds each one, which reads its csv.gz (about 0.35 s for tpcds).
+        # build_exec_cache.py stores them in a database file; opening it does not bind them,
+        # and every query binds a view again, as on the connection that setUpClass makes.
+        path = os.path.join(EXEC_CACHE, "exec_%s.duckdb" % which)
+        if os.path.exists(path):
+            return mod.duckdb.connect(path, read_only=True)
         conn = mod.duckdb.connect()
-        for table, columns in schema.items():
-            file_name = f"{directory}{table}.csv.gz"
-            conn.execute(
-                f"""
-                CREATE VIEW {table} AS
-                SELECT *
-                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
-                """
-            )
+        _exec_views(conn, schema, directory)
         return conn
     if name.endswith("_tables"):
         import marshal

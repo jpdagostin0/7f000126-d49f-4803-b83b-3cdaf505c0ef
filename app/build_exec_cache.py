@@ -3,7 +3,8 @@
 usage: python build_exec_cache.py REPO OUT_DIR [--check]
 Runs the real TestExecutor.setUpClass of the pinned checkout and writes, for tpch and tpcds,
 OUT_DIR/exec_<which>.marshal = ({table: size of its csv.gz}, {table: marshalled rows}) in schema
-order (the rows of each table are packed alone, so that one table can be unpacked alone).
+order (the rows of each table are packed alone, so that one table can be unpacked alone), and
+OUT_DIR/exec_<which>.duckdb = a database with the views of setUpClass.
 --check: also rebuilds every lazy attribute with preload.py (cache path) and compares it with
 what setUpClass made (Table columns, rows with exact types, view contents, fixture pairs)."""
 import marshal
@@ -41,6 +42,15 @@ def main():
             marshal.dump((sizes, rows), f)
         os.replace(path + ".tmp", path)
         print(path, os.path.getsize(path), "bytes", file=sys.stderr)
+        # the views of setUpClass in a database file (preload._exec_build opens it read-only)
+        path = os.path.join(out, f"exec_{which}.duckdb")
+        for p in (path, path + ".wal"):
+            if os.path.exists(p):
+                os.remove(p)
+        conn = mod.duckdb.connect(path)
+        preload._exec_views(conn, schema, directory)
+        conn.close()
+        print(path, os.path.getsize(path), "bytes", file=sys.stderr)
     if not check:
         return
     preload.EXEC_CACHE = out
@@ -65,7 +75,8 @@ def main():
                 ok = ok and same
         elif name.endswith("_conn"):
             q = "SELECT table_name FROM information_schema.tables ORDER BY 1"
-            ok = old.execute(q).fetchall() == new.execute(q).fetchall()
+            ok = new.execute("SELECT current_setting('access_mode')").fetchone()[0] == "read_only"  # the file
+            ok = ok and old.execute(q).fetchall() == new.execute(q).fetchall()
             for (t,) in old.execute(q).fetchall():
                 ok = ok and old.execute(f"SELECT * FROM {t}").fetchall() == new.execute(f"SELECT * FROM {t}").fetchall()
                 ok = ok and old.execute(f"DESCRIBE {t}").fetchall() == new.execute(f"DESCRIBE {t}").fetchall()
