@@ -92,7 +92,8 @@ TOKCHECK = os.environ.get("BR_NO_TOKCHECK") != "1"  # token streams of the long 
 TOKCHECK_SECONDS = 2.0  # CPU limit of that check; inputs left unchecked count as changed
 # files whose code runs inside Tokenizer.tokenize (with the trie of the keywords)
 PLANCHECK = os.environ.get("BR_NO_PLANCHECK") != "1"  # what the TPC-DS executor test gets from the patched code (plancheck.py)
-PLANCHECK_SECONDS = 10.0  # CPU limit of that check and of the reduced run after it
+PLANCHECK_SECONDS = 10.0  # CPU limit of that check
+PLANCHECK_RUN_SECONDS = 6.0  # CPU limit of the reduced run after it (a changed plan can run for a minute)
 PLANCHECK_TASKS = 4  # with more changed queries than this, the test is selected as before
 TOKENIZER_FILES = frozenset(("sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/trie.py", "sqlglot/jsonpath.py"))
 NO_CONE = os.environ.get("BR_NO_CONE") == "1" or cone is None  # validation: every import-time commit imports the whole tree
@@ -1805,19 +1806,16 @@ def run_tokcheck(numbers, wfd):
 def plancheck_tasks(wfd):
     """Child side, when a failure would select the held TPC-DS executor test (see finish): the
     queries of the test go through the patched code up to the executor (plancheck.py).
-    Returns (the pool tasks of the changed queries, CPU seconds left), or None when they are
-    many or unknown: the parent then selects the test as before."""
+    Returns the pool tasks of the changed queries, or None when they are many or unknown: the
+    parent then selects the test as before."""
     os.write(wfd, b"K\n")  # no time cap from here
     import plancheck
     import preload
 
-    budget = PLANCHECK_SECONDS * SLOWDOWN
-    t0 = time.process_time()
-    tasks = plancheck.changed_tasks(preload.EXEC_CACHE, budget, PLANCHECK_TASKS)
-    return None if tasks is None else (tasks, budget - (time.process_time() - t0))
+    return plancheck.changed_tasks(preload.EXEC_CACHE, PLANCHECK_SECONDS * SLOWDOWN, PLANCHECK_TASKS)
 
 
-def run_plancheck(n, tasks, left, tests, emit, started, wfd):
+def run_plancheck(n, tasks, tests, emit, started, wfd):
     """Child side, after the tests of the commit: the verdict of the held TPC-DS executor test
     n. It passes when no query changed, and else runs with the changed ones alone."""
     if not tasks:
@@ -1832,7 +1830,7 @@ def run_plancheck(n, tasks, left, tests, emit, started, wfd):
         lazymods.load()
     # past the CPU limit the alarm ends the test with an error: a failure for the parent
     old = signal.signal(signal.SIGVTALRM, plancheck._alarm)
-    signal.setitimer(signal.ITIMER_VIRTUAL, max(0.05, left))
+    signal.setitimer(signal.ITIMER_VIRTUAL, PLANCHECK_RUN_SECONDS * SLOWDOWN)
     try:
         runner.run_tests([(n, tests[n]["id"])], emit, False, {n: (None, set(tasks))}, started)
     finally:
@@ -2147,7 +2145,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
 
         runner.run_tests([(n, tests[n]["id"]) for n in order], emit_noting, False, keeps, started, skip_after_fail, plan.enders)
         if checked and checked[0] is not None:
-            run_plancheck(plan.plancheck[0], checked[0][0], checked[0][1], tests, emit, started, wfd)
+            run_plancheck(plan.plancheck[0], checked[0], tests, emit, started, wfd)
         if plan.added and plan.mode in ("fresh", "fresh_purge"):
             run_added_tests(plan.added, wfd)
         if DEBUG:
@@ -3434,7 +3432,7 @@ def run(t_start, deadline, state):
         if ran and not RUN_ALL:
             cap = SLOWDOWN * (2.0 + 3.0 * sum(cost[n] for n in ran)) + max(allowed.values())
         if plan.plancheck:
-            allowed[plan.plancheck[0]] = 6 * PLANCHECK_SECONDS * SLOWDOWN
+            allowed[plan.plancheck[0]] = 6 * PLANCHECK_RUN_SECONDS * SLOWDOWN
         return ran, held, allowed, skip, cap
 
     def execute(c, plan, index):

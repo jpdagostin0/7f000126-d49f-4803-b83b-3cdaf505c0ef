@@ -4,10 +4,10 @@ The test runs every TPC-DS query marked "execute" through sqlglot.executor.execu
 process pool and compares the rows with DuckDB's (about 40 CPU seconds, so it never runs
 here). Each query goes through two stages:
 
-  1. parse_one(sql), find_tables, optimize(...) inside execute, and transpile(sql, "duckdb")
-     for the DuckDB side;
-  2. everything else: schema and table setup, Plan, PythonExecutor, the generators that
-     execute calls, pickling between the processes, the pandas comparison.
+  1. parse_one(sql), find_tables, optimize(...) and Plan(...) inside execute, and
+     transpile(sql, "duckdb") for the DuckDB side;
+  2. everything else: schema and table setup, PythonExecutor, the generators that execute
+     calls, pickling between the processes, the pandas comparison.
 
 build() runs at image build time on the pinned tree. It stores a digest of the stage 1
 results of every query, and the line spans of every function that stage 2 runs
@@ -62,6 +62,57 @@ def _dump(node, out):
             out.append("%s:%r" % (type(v).__qualname__, v))
 
 
+def _dump_plan(plan, out):
+    """Every attribute of a plan and of its steps. A step is named by a digest of its own
+    attributes and of the steps that it depends on, so that the order inside the sets of
+    steps does not count; the dependents of each step follow at the end."""
+    expr = sys.modules["sqlglot.expressions"].Expr
+    names = {}  # id of a plan object -> its digest
+    back = []
+
+    def name(v):
+        key = id(v)
+        if key not in names:
+            names[key] = "cycle"
+            part = ["<" + type(v).__qualname__]
+            for k in sorted(vars(v)):
+                if k == "dependents" and isinstance(vars(v)[k], (set, frozenset)):
+                    back.append((key, vars(v)[k]))
+                    continue
+                part.append("@" + k)
+                walk(vars(v)[k], part)
+            names[key] = hashlib.sha1("\x00".join(part).encode("utf-8", "surrogatepass")).hexdigest()
+        return names[key]
+
+    def walk(v, part):
+        if isinstance(v, expr):
+            _dump(v, part)
+        elif isinstance(v, (list, tuple)):
+            part.append("[%d" % len(v))
+            for x in v:
+                walk(x, part)
+        elif isinstance(v, dict):
+            part.append("{%d" % len(v))
+            for k, x in v.items():
+                walk(k, part)
+                walk(x, part)
+        elif isinstance(v, (set, frozenset)):
+            members = []
+            for x in v:
+                one = []
+                walk(x, one)
+                members.append("\x01".join(one))
+            part.append("(%d" % len(v))
+            part.extend(sorted(members))
+        elif hasattr(v, "__dict__") and type(v).__module__.startswith("sqlglot."):
+            part.append(name(v))
+        else:
+            part.append("%s:%r" % (type(v).__qualname__, v))
+
+    walk(plan, out)
+    out.extend(sorted("%s<-%s" % (names[key], ",".join(sorted(name(x) for x in users))) for key, users in back))
+
+
 def stage_one(sql, schema):
     """Digest of the stage 1 results of one query (or of the exception that it raises)."""
     sqlglot = sys.modules["sqlglot"]
@@ -72,7 +123,9 @@ def stage_one(sql, schema):
         expression = pickle.loads(pickle.dumps(sqlglot.parse_one(sql)))
         _dump(expression, out)
         out.append(repr([t.name for t in sqlglot.find_tables(expression)]))
-        _dump(executor.optimize(expression, schema, leave_tables_isolated=True, dialect=None), out)
+        expression = executor.optimize(expression, schema, leave_tables_isolated=True, dialect=None)
+        _dump(expression, out)
+        _dump_plan(executor.Plan(expression), out)
     except _OutOfTime:
         raise
     except Exception as e:  # noqa: BLE001
@@ -190,18 +243,21 @@ def build(root, tables):
         codes.add(code)
         return mon.DISABLE
 
-    real_optimize = executor.optimize
+    real = executor.optimize, executor.Plan
 
-    def optimize(*args, **kwargs):  # stage 1: not recorded
-        mon.set_events(tool, 0)
-        try:
-            return real_optimize(*args, **kwargs)
-        finally:
-            mon.set_events(tool, mon.events.PY_START)
+    def unrecorded(fn):  # stage 1
+        def call(*args, **kwargs):
+            mon.set_events(tool, 0)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                mon.set_events(tool, mon.events.PY_START)
+
+        return call
 
     mon.use_tool_id(tool, "plancheck")
     mon.register_callback(tool, mon.events.PY_START, on_start)
-    executor.optimize = optimize
+    executor.optimize, executor.Plan = unrecorded(real[0]), unrecorded(real[1])
     try:
         for sql in sqls:
             expression = sqlglot.parse_one(sql)
@@ -213,7 +269,7 @@ def build(root, tables):
             list(table.rows), list(table.columns)
             mon.set_events(tool, 0)
     finally:
-        executor.optimize = real_optimize
+        executor.optimize, executor.Plan = real
         mon.set_events(tool, 0)
         mon.register_callback(tool, mon.events.PY_START, None)
         mon.free_tool_id(tool)
@@ -224,6 +280,6 @@ def build(root, tables):
         if os.path.isabs(code.co_filename) and path.startswith(prefix) and os.path.exists(path):
             last = max([code.co_firstlineno] + [line for _, _, line in code.co_lines() if line])
             spans.setdefault(path[len(prefix):], []).append((code.co_firstlineno, last))
-    if "sqlglot/planner.py" not in spans:
+    if "sqlglot/executor/python.py" not in spans:
         raise RuntimeError("stage 2 was not recorded")
     return {"tasks": [i for i, _ in todo], "digests": digests, "spans": {rel: sorted(v) for rel, v in spans.items()}}
