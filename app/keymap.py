@@ -19,6 +19,7 @@ import enum
 import marshal
 import numbers
 import os
+import struct
 import types
 import zlib
 
@@ -133,21 +134,44 @@ def diff_rows(changed, base_objects, base_state, new_objects, new_fpr, fingerpri
 
 
 class KeyMap:
-    """The key read map (keymap.bin, made by build_keymap.py)."""
+    """The key read map (keymap.bin, made by build_keymap.py).
+
+    Layout: a little-endian uint32 n, then n bytes of zlib(marshal(header)), then the body.
+    header: {"version": 2, "holders": {holder name: table id}, "unknown": bytes of array('H'),
+    "tables": bytes of array('I'), "sets": bytes of array('I')}; the two offset arrays have one
+    entry more than there are tables (sets), and table i is body[tables[i]:tables[i + 1]] as
+    zlib(marshal({stable key: set id})), set i is body[sets[i]:sets[i + 1]] as the bytes of an
+    array('H') of test numbers. A commit reads a few tables: only those are unpacked."""
 
     def __init__(self, path):
         with open(path, "rb") as f:
-            d = marshal.loads(zlib.decompress(f.read()))
+            raw = f.read()
+        (n,) = struct.unpack_from("<I", raw)
+        d = marshal.loads(zlib.decompress(raw[4:4 + n]))
+        if d["version"] != 2:
+            raise ValueError("keymap.bin version %r" % d["version"])
+        self.body = memoryview(raw)[4 + n:]
         self.holders = d["holders"]  # holder name -> table id (traced, never changed by a test)
-        self.tables = d["tables"]  # table id -> {stable key: set id}
-        self.sets = d["sets"]  # set id -> bytes of array('H') test numbers
+        self.table_offsets = array.array("I")
+        self.table_offsets.frombytes(d["tables"])
+        self.set_offsets = array.array("I")
+        self.set_offsets.frombytes(d["sets"])
+        self.loaded = {}  # table id -> {stable key: set id}
         unknown = array.array("H")
         unknown.frombytes(d["unknown"])
         self.unknown = set(unknown)  # tests whose reads are not known: never cut
 
+    def table(self, tid):
+        """{stable key: set id} of table tid."""
+        t = self.loaded.get(tid)
+        if t is None:
+            o = self.table_offsets
+            t = self.loaded[tid] = marshal.loads(zlib.decompress(self.body[o[tid]:o[tid + 1]]))
+        return t
+
     def tests(self, sid):
         a = array.array("H")
-        a.frombytes(self.sets[sid])
+        a.frombytes(self.body[self.set_offsets[sid]:self.set_offsets[sid + 1]])
         return a
 
     def readers(self, rows):
@@ -160,7 +184,7 @@ class KeyMap:
             tid = self.holders.get(holder_name(key))
             if tid is None:
                 return None  # not a traced table (or one that some test changes)
-            table = self.tables[tid]
+            table = self.table(tid)
             for sk in [WHOLE] + list(entries):
                 sid = table.get(sk)
                 if sid is not None:
@@ -175,7 +199,7 @@ def load(maps_dir):
     if _MAP[0] is None:
         try:
             _MAP[0] = KeyMap(os.path.join(maps_dir, "keymap.bin"))
-        except (OSError, ValueError, KeyError, EOFError, zlib.error):
+        except (OSError, ValueError, KeyError, EOFError, zlib.error, struct.error):
             _MAP[0] = False
     return _MAP[0] or None
 

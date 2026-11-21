@@ -871,7 +871,8 @@ def _container_writes(fn):
     for a in (fn.args.vararg, fn.args.kwarg):
         if a is not None:
             local.add(a.arg)
-    for n in ast.walk(fn):
+    nodes = list(ast.walk(fn))
+    for n in nodes:
         if isinstance(n, (ast.Global, ast.Nonlocal)):
             declared.update(n.names)
         elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
@@ -904,7 +905,7 @@ def _container_writes(fn):
         if d is not None:
             out.setdefault(d, set()).add(kind)
 
-    for n in ast.walk(fn):
+    for n in nodes:
         if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
             targets = n.targets if isinstance(n, (ast.Assign, ast.Delete)) else [n.target]
             for t in targets:
@@ -1673,7 +1674,6 @@ def preimport_for_fresh(fresh, plans, tests):
                 _SourceFileLoader(name, path).get_code(name)
             except Exception:  # noqa: BLE001
                 pass
-    gc.freeze()
 
 
 def run_added_tests(added, wfd):
@@ -1684,8 +1684,12 @@ def run_added_tests(added, wfd):
     the later tests)."""
     import unittest
 
+    import lazymods
     import runner
 
+    # loading pandas replaces assert_frame_equal in the test modules' globals, which
+    # _shared_marks sees: it loads before the first picture
+    lazymods.load()
     before = (_shared_marks(), _interpreter_settings())
     for test_id, start in added:
         os.write(wfd, b"A %d\n" % start)
@@ -1908,9 +1912,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             if plan.mode == "fresh_cone":
                 # Only the cone of the patched modules is imported again (cone.py). The child
                 # reports REDO (and the parent imports the whole tree) when the checks fail.
-                # The objects of the parent are not collected here (as in the children of the
-                # other commits, whose parent froze them): a collection would walk all of them.
-                gc.freeze()
+                # (The objects of the parent are frozen: see run_child.)
                 try:
                     cone_touched = cone.reimport(plan.cone, lambda: engine.install_overlay(ROOT, py_files))
                 except Exception as e:  # noqa: BLE001  (cone.Redo: a check failed; anything else too)
@@ -2074,10 +2076,8 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                     preload.reduce_class_fixtures(changed)
             if plan.keeps and not NO_REDUCE:
                 keeps = apply_keeps(plan, MAPS_OBJ, tests)
-        if PANDAS_USERS and any(n in PANDAS_USERS for n in order):
-            import lazymods
-
-            lazymods.load()  # before the settings snapshot below: as in the parent
+        # numpy and pandas stay lazy (lazymods.py): a test that uses them loads them. Their
+        # import changes none of the interpreter settings that emit() compares.
         if plan.watch:
             watches.extend(resolve_watch(plan.watch))
             os.write(wfd, b"H %s\n" % json.dumps([w[0] for w in watches]).encode())
@@ -2254,6 +2254,12 @@ def fixture_batch_child(batch, tests, wfd):
         import reduce
 
         t_child = time.process_time()
+        if PANDAS_USERS and any(n in PANDAS_USERS for _, order, _ in batch for n in order):
+            import lazymods
+
+            # before the pictures below: loading them adds warning filters and replaces
+            # assert_frame_equal in the test modules
+            lazymods.load()
         picture = picture_of_tests({tests[n]["id"] for _, order, _ in batch for n in order})
         dialect = sys.modules.get("sqlglot.dialects.dialect")
         if picture is None or dialect is None or not reduce.install_loaders():
@@ -2291,10 +2297,6 @@ def fixture_batch_child(batch, tests, wfd):
                     keeps = None
                     if plan.keeps and not NO_REDUCE:
                         keeps = apply_keeps(plan, MAPS_OBJ, tests)
-                    if PANDAS_USERS and any(n in PANDAS_USERS for n in order):
-                        import lazymods
-
-                        lazymods.load()  # before the settings snapshot below: as in the parent
                     stand_ins = [type(sys.modules.get(name)) for name in ("numpy", "pandas", "pandas.testing")]
                     begin()
                     now = _interpreter_settings()
@@ -2364,8 +2366,10 @@ def run_fixture_batch_child(batch, tests, time_left):
     runs past the limits of run_child, or kills the process; shared state that differs at the
     end): every commit then runs in its own child, as without this function."""
     r, w = os.pipe()
+    gc.freeze()  # (as in run_child)
     pid = os.fork()
     if pid == 0:
+        gc.enable()  # (off in the parent, see main)
         os.close(r)
         try:
             os.setpgid(0, 0)
@@ -2474,8 +2478,13 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
     plan_r = plan_w = None
     if on_diff is not None:
         plan_r, plan_w = os.pipe()
+    # The objects of this process stay out of the child's collections: they are not walked
+    # (each walk copies the pages it touches), and a cycle of this process that is garbage (a
+    # duckdb connection, see preload.refresh_class_fixtures) is never freed in the child.
+    gc.freeze()
     pid = os.fork()
     if pid == 0:
+        gc.enable()  # (off in the parent, see main)
         os.close(r)
         if plan_w is not None:
             os.close(plan_w)
@@ -2880,7 +2889,7 @@ def watch_readers(plan: Plan, verdicts, n_tests):
                         own = None  # the changed table itself is not in the map
                         break
                     continue
-                table = km.tables[tid]
+                table = km.table(tid)
                 got = own if h == name else derived
                 for sk in ([keymap.WHOLE] + list(entries)) if entries is not None else list(table):
                     sid = table.get(sk)
@@ -2905,6 +2914,10 @@ def run_order(cands, tests):
 
 
 def main():
+    # No cyclic collection in this process: its imports, plans and fixtures leave little
+    # garbage, and each collection walks every object. Each child turns it on again right
+    # after the fork, so that the tests run with the usual collector.
+    gc.disable()
     t_start = time.monotonic()
     deadline = t_start + WALL_LIMIT
     # Only the answers may reach stdout. Everything else that writes to fd 1 goes to stderr.
@@ -3496,8 +3509,9 @@ def run(t_start, deadline, state):
 
             lazy_pandas = lazymods.install()
         if lazy_pandas:
-            # numpy and pandas load when a commit that runs one of their users comes (see
-            # pandas_turn below), or never
+            # numpy and pandas never load in this process: a child loads them at the first
+            # real use by a test (most candidates that may use them never do, as their reduced
+            # runs skip the fixture entries that execute), or never
             PANDAS_USERS = users
         else:
             import pandas  # noqa: F401
@@ -3506,14 +3520,6 @@ def run(t_start, deadline, state):
     def needs_pandas(c):
         p = plans[c]
         return any(n in PANDAS_USERS for n in p.cands - p.blind)
-
-    pandas_turn = None  # the first commit before which the parent loads numpy and pandas
-    if lazy_pandas:
-        # the commits that need them run last, so that the forks before them are cheaper
-        hot = [c for c in hot if not needs_pandas(c)] + [c for c in hot if needs_pandas(c)]
-        needers = [c for c in hot + fresh if needs_pandas(c)]
-        if len(needers) >= 2:
-            pandas_turn = needers[0]  # with one, its child loads them (same cost, smaller forks)
 
     def exec_prebuild(hot_commits):
         """TestExecutor attributes that more than one child may read are built once here
@@ -3578,17 +3584,6 @@ def run(t_start, deadline, state):
                 safe = all_tests
             answers[c] = pack(sorted(safe), seconds)
 
-    pandas_here = []
-
-    def load_pandas_here():
-        if pandas_here:
-            return
-        pandas_here.append(True)
-        import lazymods
-
-        lazymods.load()
-        gc.freeze()  # (no collection first: it would walk every object, and little is garbage)
-
     preimported = []
 
     def preimport_once():
@@ -3611,17 +3606,8 @@ def run(t_start, deadline, state):
         if hot:
             preload._single_thread_duckdb()  # as import_tests() does before the other children
         preimport_once()
-        if lazy_pandas:
-            # the order of the commits is now: cone commits, function-body commits, the other
-            # import-time commits. The same rule as above for that order.
-            cone_first = [c for c in cone_first if not needs_pandas(c)] + [c for c in cone_first if needs_pandas(c)]
-            later = [c for c in fresh if c not in set(cone_first)]
-            needers = [c for c in cone_first + hot + later if needs_pandas(c)]
-            pandas_turn = needers[0] if len(needers) >= 2 else None
     cone_done = set()
     for c in cone_first:
-        if c == pandas_turn:
-            load_pandas_here()
         plan = plans[c]
         plan.mode = "fresh_cone"
         if execute_safe(c, plan, None) == "REDO":
@@ -3645,18 +3631,19 @@ def run(t_start, deadline, state):
                     wanted.add((path[:-3].replace("/", "."), cls_name))
         shared = preload.build_class_fixtures(wanted, exec_lazy=True, exec_prebuild=exec_prebuild(hot))
         log("shared fixtures", shared)
-        # the index lists the live functions with gc.get_objects(), which leaves out frozen
-        # objects (the steps above may have frozen them: preimport_for_fresh, load_pandas_here)
-        gc.unfreeze()
-        index = engine.FunctionIndex(ROOT)
-        gc.freeze()  # (no collection first: it would walk every object, and little is garbage)
+        if any(plans[c].work for c in hot):
+            # the index (only the code swaps of plan.work read it) lists the live functions with
+            # gc.get_objects(), which leaves out frozen objects (every fork freezes them, see
+            # run_child)
+            gc.unfreeze()
+            index = engine.FunctionIndex(ROOT)
     purge = bool(hot) or want_diff
 
     # 2b. Commits that change nothing but entries of .sql fixture files need no patched code:
     #     their tests run on the pinned code of this process, with the patched file text. One
     #     child serves all of them, one after the other (fixture_batch_child), instead of one
     #     fork each. The commits whose tests load numpy or pandas form a group of their own:
-    #     as today, their child runs after this process has loaded those libraries.
+    #     their child loads those libraries once, before the tests.
     prepared = {}  # commit -> what prepare_plan gave
 
     def fixture_only(c):
@@ -3736,8 +3723,6 @@ def run(t_start, deadline, state):
     for c in hot:
         if c in answered:
             continue
-        if c == pandas_turn:
-            load_pandas_here()
         if c in groups:
             members = [m for m in hot if groups.get(m) == groups[c]]
             for m in members:
@@ -3761,8 +3746,6 @@ def run(t_start, deadline, state):
             plan.keeps = {n: k for n, k in plan.keeps.items() if k[4] is None}
     preimport_once()
     for c in fresh:
-        if c == pandas_turn:
-            load_pandas_here()
         plan = plans[c]
         plan.mode = "fresh_purge" if purge else "fresh"
         execute_safe(c, plan, None)
