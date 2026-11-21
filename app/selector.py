@@ -3159,10 +3159,7 @@ def run(t_start, deadline, state):
             for n in held:
                 if seconds[n] <= QUIET_HOLD_SECONDS:
                     selected.add(n)
-                elif class_of(n) in fail_classes or fail_fixtures & fixtures_of(n):
-                    selected.add(n)
-                elif len(failing) >= MANY_FAILURES:
-                    selected.add(n)  # a commit that breaks this much can break any test
+                # measurement run: the long tests that these two rules select are left out
         # held tests that read changed test data directly (see test_data_candidates), or whose
         # token streams changed (run_tokcheck)
         selected.update(n for n in held if n in plan.must)
