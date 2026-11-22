@@ -3290,8 +3290,11 @@ def run(t_start, deadline, state):
         for name in plan.broken:  # a test file that cannot be imported: all its tests fail
             selected.update(tests_of_file.get(name.replace(".", "/") + ".py", ()))
         if not plan.all_fail and not plan.broken:
-            # long tests without a verdict of their own are never selected
-            selected.difference_update(n for n in held if seconds[n] > QUIET_HOLD_SECONDS)
+            # long tests without a verdict of their own are selected only when a test of their class fails
+            fail_cls = {tests[f]["id"].rsplit("::", 1)[0] for f in failing}
+            selected.difference_update(
+                n for n in held if seconds[n] > QUIET_HOLD_SECONDS and tests[n]["id"].rsplit("::", 1)[0] not in fail_cls
+            )
         answers[c] = pack(sorted(selected), seconds)
         if DEBUG:
             debug_rows[c] = {
