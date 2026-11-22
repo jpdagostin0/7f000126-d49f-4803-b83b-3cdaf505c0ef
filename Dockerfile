@@ -34,10 +34,14 @@ RUN python -m compileall -f -q -j 0 --invalidation-mode unchecked-hash /usr/loca
 # exit and page faults; no effect where the host has THP off).
 ENV PYTHONHASHSEED=0 \
     PYTHONMALLOC=mimalloc \
-    MIMALLOC_LARGE_OS_PAGES=1 \
+    MIMALLOC_LARGE_OS_PAGES=0 \
     MIMALLOC_RESERVE_OS_MEMORY=256MiB \
     MIMALLOC_ARENA_EAGER_COMMIT=1 \
     MIMALLOC_PURGE_DELAY=-1
+
+# CPU limits of the test runs of one commit (see the constants of selector.py).
+ENV BR_COMMIT=4 \
+    BR_FRESH=1.5
 
 # 4. our program and maps (last, so that a code change rebuilds only this). The TestExecutor row
 #    cache (preload.py) is built from the pinned csv files and checked against the real
