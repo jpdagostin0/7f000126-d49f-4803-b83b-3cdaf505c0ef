@@ -3256,9 +3256,7 @@ def run(t_start, deadline, state):
             for n in failing:
                 fail_fixtures.update(fixtures_of(n))
             for n in held:
-                if seconds[n] <= QUIET_HOLD_SECONDS:
-                    selected.add(n)
-                elif class_of(n) in fail_classes or fail_fixtures & fixtures_of(n):
+                if class_of(n) in fail_classes or fail_fixtures & fixtures_of(n):
                     selected.add(n)
                 elif len(failing) >= MANY_FAILURES:
                     selected.add(n)  # a commit that breaks this much can break any test
