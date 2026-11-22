@@ -3292,6 +3292,8 @@ def run(t_start, deadline, state):
         if not plan.all_fail and not plan.broken:
             # long tests without a verdict of their own are never selected
             selected.difference_update(n for n in held if seconds[n] > 1.9)
+            if verdicts and not failing and not unknown:
+                selected.difference_update(held)  # nothing that ran failed: no unrun test is selected
         answers[c] = pack(sorted(selected), seconds)
         if DEBUG:
             debug_rows[c] = {
