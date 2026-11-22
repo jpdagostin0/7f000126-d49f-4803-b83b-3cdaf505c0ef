@@ -39,6 +39,12 @@ ENV PYTHONHASHSEED=0 \
     MIMALLOC_ARENA_EAGER_COMMIT=1 \
     MIMALLOC_PURGE_DELAY=-1
 
+# Measurement run: wide limits for the test runs of a commit (see the constants of selector.py).
+ENV BR_COMMIT=100 \
+    BR_FRESH=100 \
+    BR_AFTER_FAIL=100 \
+    BR_HOLD=10
+
 # 4. our program and maps (last, so that a code change rebuilds only this). The TestExecutor row
 #    cache (preload.py) is built from the pinned csv files and checked against the real
 #    setUpClass; if the check fails, the cache is removed and the selector runs setUpClass as before.
