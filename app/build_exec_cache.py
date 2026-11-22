@@ -4,7 +4,8 @@ usage: python build_exec_cache.py REPO OUT_DIR [--check]
 Runs the real TestExecutor.setUpClass of the pinned checkout and writes, for tpch and tpcds,
 OUT_DIR/exec_<which>.marshal = ({table: size of its csv.gz}, {table: marshalled rows}) in schema
 order (the rows of each table are packed alone, so that one table can be unpacked alone), and
-OUT_DIR/exec_<which>.duckdb = a database with the views of setUpClass.
+OUT_DIR/exec_<which>.duckdb = a database with the views of setUpClass. Also writes
+OUT_DIR/plancheck.marshal (see plancheck.py).
 --check: also rebuilds every lazy attribute with preload.py (cache path) and compares it with
 what setUpClass made (Table columns, rows with exact types, view contents, fixture pairs)."""
 import marshal
@@ -22,6 +23,7 @@ def typed(rows):
 def main():
     repo, out = sys.argv[1], sys.argv[2]
     check = "--check" in sys.argv
+    import plancheck
     import preload
 
     preload.install_environment(repo)
@@ -51,6 +53,20 @@ def main():
         preload._exec_views(conn, schema, directory)
         conn.close()
         print(path, os.path.getsize(path), "bytes", file=sys.stderr)
+    # what test_execute_tpcds hands to the executor on the pinned tree (plancheck.py); without
+    # this file the selector goes on without that check
+    path = os.path.join(out, plancheck.NAME)
+    try:
+        saved = plancheck.build(repo, cls.tpcds_tables)
+        with open(path, "wb") as f:
+            marshal.dump(saved, f)
+        if plancheck.changed_tasks(out, 600.0, 0.0) != []:
+            raise RuntimeError("the pinned tree does not repeat its own results")
+        print(path, os.path.getsize(path), "bytes", len(saved["digests"]), "queries", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001
+        print("no plan check:", repr(e), file=sys.stderr)
+        if os.path.exists(path):
+            os.remove(path)
     if not check:
         return
     preload.EXEC_CACHE = out

@@ -91,6 +91,13 @@ TIGHT = os.environ.get("BR_NO_TIGHT") != "1"  # exact line sets of the long test
 TOKCHECK = os.environ.get("BR_NO_TOKCHECK") != "1"  # token streams of the long tests' inputs (tokcheck.py)
 TOKCHECK_SECONDS = 2.0  # CPU limit of that check; inputs left unchecked count as changed
 # files whose code runs inside Tokenizer.tokenize (with the trie of the keywords)
+PLANCHECK = os.environ.get("BR_NO_PLANCHECK") != "1"  # what the TPC-DS executor test gets from the patched code (plancheck.py)
+PLANCHECK_FRESH = os.environ.get("BR_NO_PLANCHECK_FRESH") != "1"  # the same check after a new import (plancheck_eligible)
+PLANCHECK_ALWAYS = os.environ.get("BR_PLANCHECK_ALWAYS") == "1"  # validation: the check runs for every commit that allows it
+PLANCHECK_SECONDS = 10.0  # CPU limit of that check
+# estimated CPU seconds of the run of the changed queries after it: with more, the test is selected as before
+PLANCHECK_RUN_SECONDS = float(os.environ.get("BR_PLANCHECK_RUN", "2.5"))
+PLANCHECK_RUN_CAP = max(6.0, 3.0 * PLANCHECK_RUN_SECONDS)  # CPU limit of that run (a changed plan can run for a minute)
 TOKENIZER_FILES = frozenset(("sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/trie.py", "sqlglot/jsonpath.py"))
 NO_CONE = os.environ.get("BR_NO_CONE") == "1" or cone is None  # validation: every import-time commit imports the whole tree
 
@@ -294,7 +301,7 @@ class Maps:
 
 
 class Plan:
-    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone")
+    __slots__ = ("commit", "mode", "cands", "work", "files", "note", "all_fail", "blind", "lines", "keeps", "broken", "times", "pool_died", "fpairs", "stmt_lines", "diff", "def_units", "data_cands", "skipped", "diffable", "class_filter", "plain_lines", "unaffected", "protect", "enders", "gone", "fixture_users", "global_leak", "must", "added", "infect_fresh", "infect_files", "watch", "watched", "leaks", "tokcheck", "sure_infected", "cone", "plancheck", "dkeys")
 
     def __init__(self, commit):
         self.commit = commit
@@ -329,6 +336,12 @@ class Plan:
         self.gone = set()  # module or class names that the patch removes (no reduced runs then)
         self.must = set()  # tests that read changed test data directly: selected when held
         self.tokcheck = []  # held long tests whose tokenize inputs the child tokenizes again (tokcheck.py)
+        # (the held TPC-DS executor test, the tests whose failure selects it, the pool tasks that run
+        # the changed lines or None for all, the tasks that run in any case, the largest share of
+        # the test that the changed tasks may cost, True when finish() selects the test whatever
+        # the other tests do): see prepare_plan and plancheck_tasks
+        self.plancheck = None
+        self.dkeys = False  # the keys of the import-state diff (None: too many); False: no diff was made
         self.sure_infected = set()  # tests whose own evaluations of an edited comparison change (infect.py)
         self.added = []  # (test id, first later test) of test methods that the patch adds
         self.watch = []  # (module, descriptor) of shared containers to watch (shared_write_watch)
@@ -1785,9 +1798,9 @@ def check_watches(watches):
 def run_tokcheck(numbers, wfd):
     """Child side, after the patched code is in place and before any test runs: tokenizes the
     recorded inputs of these held long tests again (tokcheck.py). Each test that gets another
-    token stream is reported ("M n"), and the parent selects it."""
+    token stream is reported ("M n"), and the parent selects it. Returns those tests."""
     if not numbers or not TOKCHECK:
-        return
+        return ()
     os.write(wfd, b"M -1\n")  # the check takes time: the parent's clock for the setup restarts
     try:
         import tokcheck
@@ -1797,6 +1810,50 @@ def run_tokcheck(numbers, wfd):
         found = set(numbers)
     for n in sorted(found):
         os.write(wfd, b"M %d\n" % n)
+    return found
+
+
+def plancheck_tasks(wfd, check):
+    """Child side, when a failure would select the held TPC-DS executor test (see finish): the
+    queries of the test go through the patched code up to the executor (plancheck.py).
+    check: plan.plancheck. Returns the pool tasks of the changed queries, or None when their
+    run costs too much or they are unknown: the parent then selects the test as before."""
+    os.write(wfd, b"K\n")  # no time cap from here
+    import plancheck
+    import preload
+
+    return plancheck.changed_tasks(preload.EXEC_CACHE, PLANCHECK_SECONDS * SLOWDOWN, check[4], check[2])
+
+
+def run_plancheck(n, tasks, check, tests, emit, started, wfd):
+    """Child side, after the tests of the commit: the verdict of the held TPC-DS executor test
+    n. It passes when no query changed, and else runs with the changed ones alone (after a
+    new import, tasks also holds the two cheapest queries: they run in any case).
+    check: plan.plancheck."""
+    if not tasks:
+        os.write(wfd, b"%d 0 0\n" % n)
+        return
+    import plancheck
+    import preload
+    import runner
+
+    if PANDAS_USERS and n in PANDAS_USERS:
+        import lazymods
+
+        lazymods.load()
+    # A changed plan can run for a minute where the pinned one took a second: the run gets
+    # three times the CPU that these queries take on the pinned tree (and the class fixtures).
+    # Past that limit the alarm ends the test with an error: a failure for the parent.
+    saved = plancheck.load(preload.EXEC_CACHE)
+    share = dict(zip(saved["tasks"], saved["share"]))
+    estimate = sum(share.get(i, 0.0) for i in tasks) * PLANCHECK_RUN_SECONDS / check[4]
+    old = signal.signal(signal.SIGVTALRM, plancheck._alarm)
+    signal.setitimer(signal.ITIMER_VIRTUAL, min(PLANCHECK_RUN_CAP, 2.0 + 3.0 * estimate) * SLOWDOWN)
+    try:
+        runner.run_tests([(n, tests[n]["id"])], emit, False, {n: (None, set(tasks))}, started)
+    finally:
+        signal.setitimer(signal.ITIMER_VIRTUAL, 0)
+        signal.signal(signal.SIGVTALRM, old)
 
 
 def child_reporters(wfd):
@@ -1893,6 +1950,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             faulthandler.dump_traceback_later(float(os.environ["BR_FAULT"]), file=sys.stderr)
         t_child = time.process_time()
         py_files = {p: t for p, t in plan.files.items() if p.endswith(".py")}
+        tok_found = set()  # held long tests whose token streams changed (run_tokcheck)
         if any(not (p.startswith("sqlglot/") or (p.startswith("tests/fixtures/") and p.endswith(".sql")))
                for p in plan.files):
             # the commit changes test code or data: no on-demand table dicts (preload._LazyTables)
@@ -1940,6 +1998,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                 bad = preload.broken_modules(test_mods)
             for name in bad:
                 os.write(wfd, b"B %s\n" % name.encode())
+            broken_seen = list(bad)
             if _interpreter_settings() != pinned_settings:
                 # The patched import changed an interpreter-wide setting (the recursion limit,
                 # the environment, ...): every test of a full run starts with it, and the runs
@@ -1957,6 +2016,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                 names = sorted({t["id"].split("::")[0][:-3].replace("/", ".") for t in tests} - set(test_mods))
                 for name in preload.broken_test_modules(names):
                     os.write(wfd, b"B %s\n" % name.encode())
+                    broken_seen.append(name)
 
             if plan_fd is None:
                 import_all_tests()
@@ -2012,7 +2072,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                 os.close(plan_fd)
                 todo = marshal.loads(b"".join(chunks)) if chunks else None
                 if todo:
-                    run_tokcheck(todo.get("tokcheck"), wfd)
+                    tok_found.update(run_tokcheck(todo.get("tokcheck"), wfd))
                 if not todo or not todo["order"]:
                     os.write(wfd, b"END\n")
                     os._exit(0)
@@ -2020,6 +2080,8 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                 skip_after_fail = todo["skip"]
                 plan.enders = todo["enders"]
                 plan.keeps = todo["keeps"]
+                # a tree with a module that does not import: the rules of finish() decide
+                plan.plancheck = None if broken_seen else todo["plancheck"]
             if bad:
                 # a test that loads a module that cannot be imported fails (the parent selects
                 # it anyway): running it would only repeat the failing import
@@ -2090,7 +2152,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
         if plan.watch:
             watches.extend(resolve_watch(plan.watch))
             os.write(wfd, b"H %s\n" % json.dumps([w[0] for w in watches]).encode())
-        run_tokcheck(plan.tokcheck, wfd)
+        tok_found.update(run_tokcheck(plan.tokcheck, wfd))
         if plan.mode != "hot":
             # The objects of the new import stay for the life of this child. Frozen, they are
             # not walked again by every collection during the test runs (the children of the
@@ -2099,7 +2161,28 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
             gc.freeze()
         t_setup = time.process_time()
         settings[0] = _interpreter_settings()
-        runner.run_tests([(n, tests[n]["id"]) for n in order], emit, False, keeps, started, skip_after_fail, plan.enders)
+        failed = []
+        checked = []
+
+        def emit_noting(number, bad):
+            emit(number, bad)
+            if bad and plan.plancheck and not checked:
+                failed.append(number)
+                if number in plan.plancheck[1] or len(failed) >= MANY_FAILURES:
+                    checked.append(plancheck_tasks(wfd, plan.plancheck))
+                    if checked[0] is not None:
+                        # the held test gets its own verdict: no run ends early on its account
+                        plan.enders.clear()
+
+        # the rules of finish() select the held test whatever the other tests do (its own
+        # evaluations of the edited comparison change, or its token streams did): checked now
+        if plan.plancheck and (PLANCHECK_ALWAYS or plan.plancheck[5] or plan.plancheck[0] in tok_found):
+            checked.append(plancheck_tasks(wfd, plan.plancheck))
+            if checked[0] is not None:
+                plan.enders.clear()
+        runner.run_tests([(n, tests[n]["id"]) for n in order], emit_noting, False, keeps, started, skip_after_fail, plan.enders)
+        if checked and checked[0] is not None:
+            run_plancheck(plan.plancheck[0], sorted(set(checked[0]).union(plan.plancheck[3])), plan.plancheck, tests, emit, started, wfd)
         if plan.added and plan.mode in ("fresh", "fresh_purge"):
             run_added_tests(plan.added, wfd)
         if DEBUG:
@@ -2576,6 +2659,11 @@ def run_child(plan, order, tests, index, allowed, time_left, skip_after_fail=(),
                     t_cap = None
                     cap = None
                     t_test = time.monotonic() + 2 * TEST_TIMEOUT * SLOWDOWN
+                elif line == b"K":
+                    # the plan check runs (see plancheck_tasks): its CPU limit is its own
+                    t_cap = None
+                    cap = None
+                    t_test = time.monotonic() + 6 * PLANCHECK_SECONDS * SLOWDOWN
                 elif line.startswith(b"D "):
                     keys = None if line == b"D many" else json.loads(line[2:])
                     if DEBUG:
@@ -2714,6 +2802,7 @@ def refine_with_diff(plan: Plan, keys, maps: Maps, tests):
     (None = too many). Nothing differs and no function body changed: the Python edits do
     nothing. Otherwise a test part can see the change only when it runs a line that reads
     one of the changed names (or a changed function): the reduced runs apply to those lines."""
+    plan.dkeys = keys
     if keys is None:
         plan.note.append("import state: many changes")
         plan.lines = {"?": None}
@@ -3140,6 +3229,7 @@ def run(t_start, deadline, state):
         return fixture_readers.get(n) or frozenset()
 
     def finish(c, plan, verdicts, status, ran, held, blind=()):
+        held = [n for n in held if n not in verdicts]  # a held test with a verdict: see run_plancheck
         failing = {n for n, bad in verdicts.items() if bad}
         selected = set(failing)
         selected.update(blind)
@@ -3323,6 +3413,42 @@ def run(t_start, deadline, state):
                 elif not (fixtures_of(n) & changed) - hit:
                     plan.cands.discard(n)
 
+    def plancheck_eligible(plan, saved, t):
+        """True when the patch can change the held TPC-DS executor test t only through what the
+        test hands to the executor (plancheck.py). Function bodies: none that the executor
+        side runs. Fixture files: none that the test reads. After a new import also: every
+        value that the import leaves changed (plan.dkeys) is data whose name has known
+        reading lines, none of them in a function that the executor side runs. A changed
+        function value is not accepted (a function is also reached by computed names), and
+        a changed attribute of an object counts under the name that holds the object."""
+        import plancheck
+
+        texts = {}
+        for rel, text in plan.files.items():
+            if rel.startswith("tests/fixtures/") and rel.endswith(".sql") and t not in maps.tests(maps.meta["opened"].get(rel, 0)):
+                continue
+            try:
+                with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+                    texts[rel] = (f.read(), text)
+            except (OSError, ValueError):
+                texts[rel] = (None, text)  # a new file, or not text
+        if not plancheck.eligible(saved, texts, plan.mode != "hot"):
+            return False
+        if plan.mode == "hot":
+            return True
+        spans = saved["spans"]
+        for row in plan.dkeys:
+            key, is_function = row[0], row[1]
+            name = key[-2] if key[0] == "O" else key[-1]
+            if is_function or not isinstance(name, str) or name == "__bases__":
+                return False
+            readers = maps.readers(name)
+            if not readers or len(readers) > 600:
+                return False  # read in an unknown way, or read everywhere
+            if any(a <= ln <= b for path, ln in readers for a, b in spans.get(path, ())):
+                return False
+        return True
+
     def prepare_plan(plan):
         """What the child of this commit runs: (tests to run, held tests, seconds allowed per
         test, tests that do not run after a failure, cap on the seconds of all runs)."""
@@ -3356,6 +3482,37 @@ def run(t_start, deadline, state):
         # are selected as they are. The answer then holds every candidate without a pass.
         plan.enders = {}
         long_held = [t for t in held if seconds[t] > QUIET_HOLD_SECONDS]
+        plan.plancheck = None
+        with_import = plan.mode != "hot"
+        if with_import:
+            # after a new import the check needs the import-state diff, and a tree without
+            # removed names or added tests
+            usable = PLANCHECK_FRESH and plan.dkeys is not False and plan.dkeys is not None and not plan.gone and not plan.added
+        else:
+            usable = True
+        if PLANCHECK and usable and not RUN_ALL and not plan.watch and ran:
+            import plancheck
+
+            t = next((n for n in long_held if tests[n]["id"] == plancheck.TEST_ID), None)
+            saved = plancheck.load(preload.EXEC_CACHE) if t is not None and t not in plan.must else None
+            if saved and plancheck_eligible(plan, saved, t):
+                t_class, t_fixtures = tests[t]["id"].rsplit("::", 1)[0], fixtures_of(t)
+                # the pool tasks that run the changed lines (the map counts a query's parse
+                # with its task), when no other part of the test runs them
+                keep = plan.keeps.get(t)
+                only = None
+                if keep is not None and keep[2] and keep[4]:
+                    units = maps.test_units(t)[3]
+                    if all(units[u][0] == "t" for u in keep[4]):
+                        only = keep[2]
+                plan.plancheck = (
+                    t,
+                    {n for n in ran if tests[n]["id"].rsplit("::", 1)[0] == t_class or t_fixtures & fixtures_of(n)},
+                    only,
+                    saved["witness"] if with_import else [],
+                    PLANCHECK_RUN_SECONDS / (maps.cost[t] if maps.cost else seconds[t] * 1.5),
+                    t in plan.sure_infected,
+                )
         if long_held and not RUN_ALL and not plan.watch and max(seconds[t] for t in long_held) >= sum(seconds[n] for n in ran):
             plan.enders["held"] = set(long_held)
             left_cost = sum(cost[n] for n in ran)
@@ -3374,6 +3531,8 @@ def run(t_start, deadline, state):
         cap = None
         if ran and not RUN_ALL:
             cap = SLOWDOWN * (2.0 + 3.0 * sum(cost[n] for n in ran)) + max(allowed.values())
+        if plan.plancheck:
+            allowed[plan.plancheck[0]] = 6 * PLANCHECK_RUN_CAP * SLOWDOWN
         return ran, held, allowed, skip, cap
 
     def execute(c, plan, index):
@@ -3407,7 +3566,7 @@ def run(t_start, deadline, state):
                 refine_with_diff(plan, keys, maps, tests)
                 ran, allowed, skip, cap = prepare()
                 return {"order": ran, "keeps": plan.keeps, "skip": skip, "allowed": allowed, "cap": cap, "enders": plan.enders,
-                        "tokcheck": plan.tokcheck}
+                        "tokcheck": plan.tokcheck, "plancheck": plan.plancheck}
 
             verdicts, status, hung = run_child(plan, None, tests, index, {}, left - 2.0, (), on_diff)
             if status == "REDO" and "ran" not in box:
