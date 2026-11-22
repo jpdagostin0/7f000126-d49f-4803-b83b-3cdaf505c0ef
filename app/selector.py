@@ -1907,6 +1907,7 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                 sys.path[:] = PRE_PATH
             import preload
 
+            pinned_settings = _interpreter_settings()
             if plan.mode == "fresh_cone":
                 # Only the cone of the patched modules is imported again (cone.py). The child
                 # reports REDO (and the parent imports the whole tree) when the checks fail.
@@ -1938,6 +1939,13 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                 bad = preload.broken_modules(test_mods)
             for name in bad:
                 os.write(wfd, b"B %s\n" % name.encode())
+            if _interpreter_settings() != pinned_settings:
+                # The patched import changed an interpreter-wide setting (the recursion limit,
+                # the environment, ...): every test of a full run starts with it, and the runs
+                # here do not show what it does there (pytest's call stack is deeper than this
+                # runner's). Every test is selected (see finish), unrun.
+                os.write(wfd, b"G 0\nEND\n")
+                os._exit(0)
 
             def import_all_tests():
                 # Every test file: one that cannot be imported any more fails all its tests
