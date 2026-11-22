@@ -115,6 +115,7 @@ QUIET_HOLD_SECONDS = float(os.environ.get("BR_QUIET_HOLD", "5.0"))
 AFTER_FAIL_RATIO = float(os.environ.get("BR_AFTER_FAIL", "0.5"))
 MANY_FAILURES = 8  # with this many failing tests, a long test on the same code is selected too
 PROTECT_RUNS = 3  # tests of a long held test's class that run whatever the CPU limit (see choose)
+RUN_ALL_RATIO = float(os.environ.get("BR_ALL_RATIO", "0.45"))  # see choose: all runs of a commit against the cost of selecting them
 TEST_TIMEOUT = 4.0  # a test that runs longer than this (and 25 times its usual time) counts as hung
 SETUP_TIMEOUT = 6.0  # a child whose imports take longer than this is stopped
 SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1.0"))  # local runs on a loaded machine
@@ -3351,7 +3352,14 @@ def run(t_start, deadline, state):
             if tests[n]["id"].rsplit("::", 1)[0] in protect_classes
             or (protect_fixtures and protect_fixtures & fixtures_of(n) and cost[n] <= 2.0)
         }
-        if sum(cost[n] for n in ran) > budget:
+        total = sum(cost[n] for n in ran)
+        if budget < total:
+            bins = pack(ran, seconds)
+            if total <= RUN_ALL_RATIO * (WORKER_COST * len(bins) + max(sum(seconds[n] for n in w) for w in bins)):
+                # all the runs together cost well under what these tests cost when they are
+                # selected as they are: the limit of the commit does not apply
+                budget = total
+        if total > budget:
             # The CPU limit does not allow every run. A held test is selected as it is, which
             # costs its recorded seconds: so the runs that save the most recorded seconds per
             # CPU second go first, and the tests that are cheap to select are the ones held.
