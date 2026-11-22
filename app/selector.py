@@ -3291,7 +3291,7 @@ def run(t_start, deadline, state):
             selected.update(tests_of_file.get(name.replace(".", "/") + ".py", ()))
         if not plan.all_fail and not plan.broken:
             # long tests without a verdict of their own are never selected
-            selected.difference_update(n for n in held if seconds[n] > QUIET_HOLD_SECONDS)
+            selected.difference_update(n for n in held if seconds[n] > 1.9)
         answers[c] = pack(sorted(selected), seconds)
         if DEBUG:
             debug_rows[c] = {
