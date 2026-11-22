@@ -208,7 +208,7 @@ def eligible(saved, changed, at_import=False):
     return True
 
 
-def changed_tasks(cache_dir, budget, max_share, only=None):
+def changed_tasks(cache_dir, budget, max_share, only=None, partial=None):
     """The pool tasks whose stage 1 results in this process are not those of the pinned tree.
     None when a run of them would cost more than max_share of the whole test (by the times
     of the pinned tree, saved["share"]), or when there is no answer within budget CPU seconds.
@@ -235,6 +235,8 @@ def changed_tasks(cache_dir, budget, max_share, only=None):
                 out.append(i)
                 spent += saved["share"][k]
                 if spent > max_share:
+                    if partial is not None:
+                        partial.extend(out[:-1])  # the changed queries that still fit the limit
                     return None
         return sorted(out)
     except _OutOfTime:

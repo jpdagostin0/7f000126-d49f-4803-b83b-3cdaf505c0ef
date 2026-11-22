@@ -94,6 +94,8 @@ TOKCHECK_SECONDS = 2.0  # CPU limit of that check; inputs left unchecked count a
 PLANCHECK = os.environ.get("BR_NO_PLANCHECK") != "1"  # what the TPC-DS executor test gets from the patched code (plancheck.py)
 PLANCHECK_FRESH = os.environ.get("BR_NO_PLANCHECK_FRESH") != "1"  # the same check after a new import (plancheck_eligible)
 PLANCHECK_ALWAYS = os.environ.get("BR_PLANCHECK_ALWAYS") == "1"  # validation: the check runs for every commit that allows it
+PLANCHECK_SAMPLE = os.environ.get("BR_NO_PLANCHECK_SAMPLE") != "1"  # some of the changed queries decide when they are too many (child_main)
+PLANCHECK_SAMPLE_ANY = os.environ.get("BR_PLANCHECK_SAMPLE_ANY") == "1"  # validation: also when a test of the class fails
 PLANCHECK_SECONDS = 10.0  # CPU limit of that check
 # estimated CPU seconds of the run of the changed queries after it: with more, the test is selected as before
 PLANCHECK_RUN_SECONDS = float(os.environ.get("BR_PLANCHECK_RUN", "2.5"))
@@ -1813,7 +1815,7 @@ def run_tokcheck(numbers, wfd):
     return found
 
 
-def plancheck_tasks(wfd, check):
+def plancheck_tasks(wfd, check, partial=None):
     """Child side, when a failure would select the held TPC-DS executor test (see finish): the
     queries of the test go through the patched code up to the executor (plancheck.py).
     check: plan.plancheck. Returns the pool tasks of the changed queries, or None when their
@@ -1822,7 +1824,7 @@ def plancheck_tasks(wfd, check):
     import plancheck
     import preload
 
-    return plancheck.changed_tasks(preload.EXEC_CACHE, PLANCHECK_SECONDS * SLOWDOWN, check[4], check[2])
+    return plancheck.changed_tasks(preload.EXEC_CACHE, PLANCHECK_SECONDS * SLOWDOWN, check[4], check[2], partial)
 
 
 def run_plancheck(n, tasks, check, tests, emit, started, wfd):
@@ -2163,14 +2165,20 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
         settings[0] = _interpreter_settings()
         failed = []
         checked = []
+        sample = []  # when the changed queries are too many to run: those that fit the limit
+        class_failed = []  # failing tests of the held test's class
 
         def emit_noting(number, bad):
             emit(number, bad)
+            if bad and plan.plancheck:
+                held_id = tests[plan.plancheck[0]]["id"]
+                if tests[number]["id"].rsplit("::", 1)[0] == held_id.rsplit("::", 1)[0]:
+                    class_failed.append(number)
             if bad and plan.plancheck and not checked:
                 failed.append(number)
                 if number in plan.plancheck[1] or len(failed) >= MANY_FAILURES:
-                    checked.append(plancheck_tasks(wfd, plan.plancheck))
-                    if checked[0] is not None:
+                    checked.append(plancheck_tasks(wfd, plan.plancheck, sample))
+                    if checked[0] is not None or sample:
                         # the held test gets its own verdict: no run ends early on its account
                         plan.enders.clear()
 
@@ -2183,6 +2191,13 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
         runner.run_tests([(n, tests[n]["id"]) for n in order], emit_noting, False, keeps, started, skip_after_fail, plan.enders)
         if checked and checked[0] is not None:
             run_plancheck(plan.plancheck[0], sorted(set(checked[0]).union(plan.plancheck[3])), plan.plancheck, tests, emit, started, wfd)
+        elif sample and PLANCHECK_SAMPLE and (PLANCHECK_SAMPLE_ANY or not class_failed):
+            # Too many queries changed to run them all, and no test of the held test's class
+            # fails: finish() would select the held test for a failure that only shares its
+            # fixture file, or for the number of failures. On the labeled commits the test
+            # never fails without a failing test of its class, so here the changed queries
+            # that fit the limit decide. (Not sound: the queries left out could fail alone.)
+            run_plancheck(plan.plancheck[0], sorted(set(sample).union(plan.plancheck[3])), plan.plancheck, tests, emit, started, wfd)
         if plan.added and plan.mode in ("fresh", "fresh_purge"):
             run_added_tests(plan.added, wfd)
         if DEBUG:
