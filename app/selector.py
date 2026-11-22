@@ -107,6 +107,7 @@ HOLD_FACTOR = float(os.environ.get("BR_HOLD_FACTOR", "0.7"))
 QUIET_HOLD_SECONDS = float(os.environ.get("BR_QUIET_HOLD", "5.0"))
 AFTER_FAIL_RATIO = float(os.environ.get("BR_AFTER_FAIL", "0.5"))
 MANY_FAILURES = 8  # with this many failing tests, a long test on the same code is selected too
+PROTECT_RUNS = 3  # tests of a long held test's class that run whatever the CPU limit (see choose)
 TEST_TIMEOUT = 4.0  # a test that runs longer than this (and 25 times its usual time) counts as hung
 SETUP_TIMEOUT = 6.0  # a child whose imports take longer than this is stopped
 SLOWDOWN = float(os.environ.get("BR_SLOWDOWN", "1.0"))  # local runs on a loaded machine
@@ -3171,6 +3172,10 @@ def run(t_start, deadline, state):
                     selected.add(n)
                 elif len(failing) >= MANY_FAILURES:
                     selected.add(n)  # a commit that breaks this much can break any test
+                elif plan.protect and not any(p in verdicts for p in plan.protect):
+                    # none of the tests whose verdicts decide about the long tests (see
+                    # protect) has one: nothing is known about this test
+                    selected.add(n)
         # held tests that read changed test data directly (see test_data_candidates), or whose
         # token streams changed (run_tokcheck)
         selected.update(n for n in held if n in plan.must)
@@ -3262,9 +3267,16 @@ def run(t_start, deadline, state):
             # CPU second go first, and the tests that are cheap to select are the ones held.
             keep_set = set()
             acc = 0.0
+            # finish() leaves a long held test out when no test of its class fails: the cheapest
+            # few of that class run whatever the limit, so that this is never said unseen
+            in_class = [n for n in plan.protect if tests[n]["id"].rsplit("::", 1)[0] in protect_classes]
+            sure = set(sorted(in_class or plan.protect, key=lambda n: (cost[n], n))[:PROTECT_RUNS])
+            # a long test that runs with the changed entries of its fixture file alone (see
+            # class_fixture_rule): its real cost is a fraction of the estimate
+            sure.update(n for n in ran if n in plan.fixture_users and seconds[n] > QUIET_HOLD_SECONDS)
             for n in sorted(ran, key=lambda n: (n not in plan.protect and tests[n]["id"] not in SCALED_IDS,
                                                 -(seconds[n] + 0.002) / (cost[n] + 0.002), cost[n])):
-                if acc + cost[n] > budget and tests[n]["id"] not in SCALED_IDS:
+                if acc + cost[n] > budget and tests[n]["id"] not in SCALED_IDS and n not in sure:
                     continue  # a test with a small-scale variant always runs (see compute_keeps)
                 acc += cost[n]
                 keep_set.add(n)
